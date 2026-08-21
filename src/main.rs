@@ -1,9 +1,14 @@
 use clap::{Args, Parser, Subcommand};
+use npc_system::belief::BeliefKind;
+use npc_system::goal::GoalKind;
+use npc_system::id::NpcId;
+use npc_system::npc::{Npc, NpcState, Sex};
 use npc_system::statistics::{
     CumulativeStatistics, SimulationHealthMetrics, SimulationWarning, YearStatistics,
 };
 use npc_system::{Simulation, SimulationConfig, SimulationError, World, WorldDanger};
 use serde::Serialize;
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::num::{NonZeroU16, NonZeroU32};
@@ -52,6 +57,14 @@ struct SimulateArgs {
     /// 年次統計を保存するJSONファイル。
     #[arg(long, value_name = "FILE")]
     output: Option<PathBuf>,
+
+    /// 終了時に詳細表示するNPC ID。複数回指定できる。
+    #[arg(long = "npc", value_name = "ID")]
+    npc_ids: Vec<u32>,
+
+    /// 10年ごとの進捗を省略し、最終結果だけを表示する。
+    #[arg(long)]
+    summary_only: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -169,16 +182,22 @@ fn simulate(args: SimulateArgs) -> Result<(), AppError> {
         Simulation::new(town_count, initial_population, args.seed, config.clone())?;
     let initial_state = capture_state(&simulation.world);
 
-    print_initial_summary(&initial_state);
+    if !args.summary_only {
+        print_progress_header(&initial_state);
+    }
 
     let mut period = PeriodSummary::default();
+    let mut period_start_year = 1;
     for elapsed_years in 1..=requested_years {
         // 参照を保持したまま次の年へ進めないよう、直後にcloneする。
         let year = simulation.run_year()?.clone();
         period.add_year(&year);
 
         if elapsed_years % 10 == 0 || elapsed_years == requested_years {
-            print_period_summary(&year, &period);
+            if !args.summary_only {
+                print_period_summary(period_start_year, &year, &period);
+            }
+            period_start_year = year.year.saturating_add(1);
             period = PeriodSummary::default();
         }
     }
@@ -189,6 +208,7 @@ fn simulate(args: SimulateArgs) -> Result<(), AppError> {
     let final_state = capture_state(&simulation.world);
 
     print_final_summary(&initial_state, &final_state, &cumulative, health, &warnings);
+    print_requested_npcs(&simulation.world, &args.npc_ids);
 
     if let Some(path) = args.output.as_deref() {
         let report = SimulationReport {
@@ -234,22 +254,37 @@ fn capture_state(world: &World) -> StateMetadata {
     }
 }
 
-fn print_initial_summary(initial: &StateMetadata) {
-    println!("Year {}", initial.year);
-    println!("Population: {}", initial.total_population);
+fn print_progress_header(initial: &StateMetadata) {
+    println!("=== シミュレーション進捗 ===");
+    println!(
+        "{:<13} {:>10} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
+        "期間", "人口", "出生", "死亡", "流入", "流出", "都市移住", "提携"
+    );
+    println!(
+        "{:<13} {:>10} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
+        format!("{}年", initial.year),
+        format_number(initial.total_population),
+        "-",
+        "-",
+        "-",
+        "-",
+        "-",
+        "-"
+    );
 }
 
-fn print_period_summary(year: &YearStatistics, period: &PeriodSummary) {
-    println!("\nYear {}", year.year);
-    println!("Population: {}", year.total_population);
-    println!("Births: {}", period.births);
-    println!("Deaths: {}", period.deaths);
-    println!("External immigration: {}", period.external_immigration);
-    println!("External emigration: {}", period.external_emigration);
-    println!("Internal migrations: {}", period.internal_migrations);
-    println!("Partnerships: {}", period.partnerships);
-    println!("Belief changes: {}", period.belief_changes);
-    println!("Goal changes: {}", period.goal_changes);
+fn print_period_summary(start_year: u16, year: &YearStatistics, period: &PeriodSummary) {
+    println!(
+        "{:<13} {:>10} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
+        format!("{}-{}年", start_year, year.year),
+        format_number(year.total_population),
+        format_number(period.births),
+        format_number(period.deaths),
+        format_number(period.external_immigration),
+        format_number(period.external_emigration),
+        format_number(period.internal_migrations),
+        format_number(period.partnerships),
+    );
 }
 
 fn print_final_summary(
@@ -259,48 +294,330 @@ fn print_final_summary(
     health: SimulationHealthMetrics,
     warnings: &[SimulationWarning],
 ) {
-    println!("\nSimulation finished");
-    println!("\nInitial population: {}", initial.total_population);
-    println!("Final population: {}", final_state.total_population);
-    println!("Unique NPCs: {}", final_state.total_unique_npcs);
-    println!("\nBirths: {}", cumulative.births);
-    println!("Deaths: {}", cumulative.deaths);
-    println!("Immigration: {}", cumulative.external_immigration);
-    println!("Emigration: {}", cumulative.external_emigration);
-    println!("Internal migrations: {}", cumulative.internal_migrations);
-    println!("Partnerships: {}", cumulative.partnerships);
-    println!("\nNatural deaths: {}", cumulative.natural_deaths);
-    println!("Natural disaster deaths: {}", cumulative.disaster_deaths);
-    println!("Disease deaths: {}", cumulative.disease_deaths);
-    println!("War deaths: {}", cumulative.war_deaths);
-    println!("Famine deaths: {}", cumulative.famine_deaths);
+    let population_change = if initial.total_population == 0 {
+        0.0
+    } else {
+        (final_state.total_population as f64 / initial.total_population as f64 - 1.0) * 100.0
+    };
+
+    println!("\n=== 統計サマリー ===");
     println!(
-        "\nAverage relationships/NPC: {:.2}",
+        "期間              : {}年",
+        final_state.year.saturating_sub(initial.year)
+    );
+    println!(
+        "人口              : {} → {} ({population_change:+.1}%)",
+        format_number(initial.total_population),
+        format_number(final_state.total_population)
+    );
+    println!(
+        "登場した固有NPC   : {}",
+        format_number(final_state.total_unique_npcs)
+    );
+
+    println!("\nイベント累計");
+    println!("  出生            : {}", format_number(cumulative.births));
+    println!("  死亡            : {}", format_number(cumulative.deaths));
+    println!(
+        "  外部流入 / 流出 : {} / {}",
+        format_number(cumulative.external_immigration),
+        format_number(cumulative.external_emigration)
+    );
+    println!(
+        "  都市間移住      : {}",
+        format_number(cumulative.internal_migrations)
+    );
+    println!(
+        "  パートナー成立  : {}",
+        format_number(cumulative.partnerships)
+    );
+
+    println!("\n死亡内訳");
+    print_death_cause("自然死", cumulative.natural_deaths, cumulative.deaths);
+    print_death_cause("自然災害", cumulative.disaster_deaths, cumulative.deaths);
+    print_death_cause("疫病", cumulative.disease_deaths, cumulative.deaths);
+    print_death_cause("戦争", cumulative.war_deaths, cumulative.deaths);
+    print_death_cause("飢饉", cumulative.famine_deaths, cumulative.deaths);
+
+    println!("\n社会状態");
+    println!(
+        "  平均関係数/NPC       : {:.2}",
         health.average_active_relationships
     );
     println!(
-        "Average strong relationships/NPC: {:.2}",
+        "  平均強関係数/NPC     : {:.2}",
         health.average_strong_relationships
     );
     println!(
-        "Extreme relationships (0 or 10): {:.1}%",
+        "  極端な関係の割合     : {:.1}%",
         health.extreme_relationship_fraction * 100.0
     );
-    println!("Belief changes: {}", cumulative.belief_changes);
-    println!("Goal changes: {}", cumulative.goal_changes);
-    println!("\nTown populations:");
+    println!(
+        "  信念変更 / 目標変更  : {} / {}",
+        format_number(cumulative.belief_changes),
+        format_number(cumulative.goal_changes)
+    );
+
+    println!("\n都市人口");
+    println!(
+        "  {:<4} {:<12} {:>10} {:>10} {:>9}",
+        "ID", "都市", "人口", "収容力", "使用率"
+    );
     for town in &final_state.town_populations {
-        println!("  {}: {}", town.name, town.population);
+        let occupancy = town.population as f64 / f64::from(town.capacity) * 100.0;
+        println!(
+            "  {:<4} {:<12} {:>10} {:>10} {:>8.1}%",
+            town.id,
+            town.name,
+            format_number(town.population),
+            format_number(town.capacity as usize),
+            occupancy
+        );
     }
 
     if warnings.is_empty() {
-        println!("\nWarnings: none");
+        println!("\n警告: なし");
     } else {
-        println!("\nWarnings:");
+        println!("\n警告");
         for warning in warnings {
-            println!("  {warning}");
+            println!("  - {}", warning_label(warning));
         }
     }
+}
+
+fn print_death_cause(label: &str, count: usize, total: usize) {
+    let share = if total == 0 {
+        0.0
+    } else {
+        count as f64 / total as f64 * 100.0
+    };
+    println!("  - {label}: {} ({share:.1}%)", format_number(count));
+}
+
+fn warning_label(warning: &SimulationWarning) -> String {
+    match warning {
+        SimulationWarning::RelationshipPolarization { fraction } => format!(
+            "関係値が0または10の関係が全体の{:.0}%を占めています",
+            fraction * 100.0
+        ),
+        SimulationWarning::DenseRelationshipGraph { average } => {
+            format!("NPCあたりの平均関係数が{average:.1}件で過密です")
+        }
+        SimulationWarning::TownConcentration { share } => {
+            format!("最大都市に全人口の{:.0}%が集中しています", share * 100.0)
+        }
+        SimulationWarning::NoMigration => "都市間移住が発生していません".to_owned(),
+        SimulationWarning::NoGoalChanges => "目標変更が発生していません".to_owned(),
+        SimulationWarning::FrequentGoalChanges {
+            average_per_npc_year,
+        } => format!("NPCあたりの目標変更が年平均{average_per_npc_year:.2}回で頻繁です"),
+        SimulationWarning::PopulationExplosion { factor } => {
+            format!("人口が初期値の{factor:.1}倍に増加しています")
+        }
+        SimulationWarning::PopulationCollapse { decline } => {
+            format!("人口が初期値から{:.0}%減少しています", decline * 100.0)
+        }
+    }
+}
+
+fn print_requested_npcs(world: &World, requested_ids: &[u32]) {
+    if requested_ids.is_empty() {
+        return;
+    }
+
+    println!("\n=== NPC詳細 ===");
+    let mut displayed = BTreeSet::new();
+    for &raw_id in requested_ids {
+        if !displayed.insert(raw_id) {
+            continue;
+        }
+        let id = NpcId(raw_id);
+        match world.npc(id) {
+            Some(npc) => print_npc_details(world, npc),
+            None => println!(
+                "\nNPC #{raw_id}: 見つかりません（存在するID: 0..={}）",
+                world.npcs.len().saturating_sub(1)
+            ),
+        }
+    }
+}
+
+fn print_npc_details(world: &World, npc: &Npc) {
+    println!("\n--- {} [ID: {}] ---", npc.name, npc.id.0);
+    println!("状態       : {}", npc_status(npc));
+    println!("年齢       : {}", npc_age(npc));
+    println!("性別       : {}", sex_label(npc.sex));
+    println!("出生地     : {}", town_name(world, npc.hometown));
+    println!("最終居住地 : {}", town_name(world, npc.town));
+    println!("現在状態   : {}", state_label(npc.state));
+    println!(
+        "能力       : 身体 {}/10 | 器用 {}/10 | 知性 {}/10 | 魅力 {}/10 | 意志 {}/10",
+        npc.attributes.physical,
+        npc.attributes.dexterity,
+        npc.attributes.intelligence,
+        npc.attributes.charisma,
+        npc.attributes.willpower
+    );
+    println!(
+        "目標       : {}（進捗 {:.0}%、{}年から）",
+        goal_label(npc.goal.kind),
+        npc.goal.progress * 100.0,
+        npc.goal.since_year
+    );
+
+    println!("信念");
+    if npc.beliefs.is_empty() {
+        println!("  - なし");
+    } else {
+        for belief in &npc.beliefs {
+            println!("  - {}: {}/10", belief_label(belief.kind), belief.strength);
+        }
+    }
+
+    let strong_relationships = npc
+        .relationships
+        .values()
+        .filter(|relationship| relationship.is_strong())
+        .count();
+    println!(
+        "関係       : {}件（強い関係 {}件）",
+        npc.relationships.len(),
+        strong_relationships
+    );
+
+    println!("家族");
+    print_relative_group(world, "パートナー", npc.partner.into_iter().collect());
+    print_relative_group(world, "親", npc.parents.clone());
+    print_relative_group(world, "祖父母", grandparents(world, npc));
+    print_relative_group(world, "兄弟姉妹", siblings(world, npc));
+    print_relative_group(world, "子", npc.children.clone());
+    print_relative_group(world, "孫", grandchildren(world, npc));
+}
+
+fn print_relative_group(world: &World, label: &str, mut ids: Vec<NpcId>) {
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
+        println!("  {label}: なし");
+        return;
+    }
+
+    println!("  {label}:");
+    for id in ids {
+        if let Some(relative) = world.npc(id) {
+            println!(
+                "    - {} [ID: {}] / {} / {} / {}",
+                relative.name,
+                relative.id.0,
+                sex_label(relative.sex),
+                npc_age(relative),
+                npc_status(relative)
+            );
+        }
+    }
+}
+
+fn grandparents(world: &World, npc: &Npc) -> Vec<NpcId> {
+    npc.parents
+        .iter()
+        .filter_map(|&id| world.npc(id))
+        .flat_map(|parent| parent.parents.iter().copied())
+        .collect()
+}
+
+fn siblings(world: &World, npc: &Npc) -> Vec<NpcId> {
+    npc.parents
+        .iter()
+        .filter_map(|&id| world.npc(id))
+        .flat_map(|parent| parent.children.iter().copied())
+        .filter(|&id| id != npc.id)
+        .collect()
+}
+
+fn grandchildren(world: &World, npc: &Npc) -> Vec<NpcId> {
+    npc.children
+        .iter()
+        .filter_map(|&id| world.npc(id))
+        .flat_map(|child| child.children.iter().copied())
+        .collect()
+}
+
+fn town_name(world: &World, id: npc_system::id::TownId) -> &str {
+    world.town(id).map_or("不明", |town| town.name.as_str())
+}
+
+fn npc_status(npc: &Npc) -> &'static str {
+    match (npc.alive, npc.in_world) {
+        (false, _) => "死亡",
+        (true, false) => "生存・外部転出",
+        (true, true) => "生存・世界内",
+    }
+}
+
+fn npc_age(npc: &Npc) -> String {
+    match (npc.alive, npc.in_world) {
+        (false, _) => format!("{}歳（死亡時）", npc.age),
+        (true, false) => format!("{}歳（転出時）", npc.age),
+        (true, true) => format!("{}歳", npc.age),
+    }
+}
+
+fn sex_label(sex: Sex) -> &'static str {
+    match sex {
+        Sex::Male => "男性",
+        Sex::Female => "女性",
+    }
+}
+
+fn state_label(state: NpcState) -> &'static str {
+    match state {
+        NpcState::Normal => "通常",
+        NpcState::Sick => "病気",
+        NpcState::Evacuating => "避難中",
+    }
+}
+
+fn goal_label(goal: GoalKind) -> &'static str {
+    match goal {
+        GoalKind::Survive => "生き延びる",
+        GoalKind::ProtectFamily => "家族を守る",
+        GoalKind::FindPartner => "パートナーを探す",
+        GoalKind::RaiseChildren => "子どもを育てる",
+        GoalKind::BecomeSkilled => "技能を身につける",
+        GoalKind::GainWealth => "富を得る",
+        GoalKind::GainStatus => "地位を得る",
+        GoalKind::MoveToBetterTown => "より良い都市へ移る",
+        GoalKind::ProtectTown => "都市を守る",
+        GoalKind::SeekKnowledge => "知識を求める",
+        GoalKind::LivePeacefully => "平穏に暮らす",
+    }
+}
+
+fn belief_label(belief: BeliefKind) -> &'static str {
+    match belief {
+        BeliefKind::ProtectFamily => "家族を守る",
+        BeliefKind::HelpOthers => "他者を助ける",
+        BeliefKind::KeepPromises => "約束を守る",
+        BeliefKind::ValueFreedom => "自由を重んじる",
+        BeliefKind::ValueOrder => "秩序を重んじる",
+        BeliefKind::ValueWealth => "富を重んじる",
+        BeliefKind::ValueKnowledge => "知識を重んじる",
+        BeliefKind::ProtectHometown => "故郷を守る",
+        BeliefKind::DistrustOutsiders => "外部者を警戒する",
+        BeliefKind::JudgeIndividuals => "個人を見て判断する",
+    }
+}
+
+fn format_number(value: usize) -> String {
+    let digits = value.to_string();
+    let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, character) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            formatted.push(',');
+        }
+        formatted.push(character);
+    }
+    formatted
 }
 
 fn write_report(path: &Path, report: &SimulationReport<'_>) -> Result<(), AppError> {
@@ -346,6 +663,11 @@ mod tests {
             "harsh",
             "--output",
             "result.json",
+            "--npc",
+            "3185",
+            "--npc",
+            "11023",
+            "--summary-only",
         ])
         .unwrap();
 
@@ -356,6 +678,8 @@ mod tests {
         assert_eq!(args.seed, 12_345);
         assert_eq!(args.world_danger, WorldDanger::Harsh);
         assert_eq!(args.output, Some(PathBuf::from("result.json")));
+        assert_eq!(args.npc_ids, vec![3_185, 11_023]);
+        assert!(args.summary_only);
     }
 
     #[test]
@@ -394,5 +718,13 @@ mod tests {
         assert_eq!(summary.births, 8);
         assert_eq!(summary.deaths, 3);
         assert_eq!(summary.internal_migrations, 10);
+    }
+
+    #[test]
+    fn formats_counts_with_group_separators() {
+        assert_eq!(format_number(0), "0");
+        assert_eq!(format_number(999), "999");
+        assert_eq!(format_number(1_000), "1,000");
+        assert_eq!(format_number(12_345_678), "12,345,678");
     }
 }
