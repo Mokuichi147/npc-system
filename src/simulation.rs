@@ -33,12 +33,12 @@ pub enum SimulationError {
     InvalidConfiguration(String),
     #[error("year {year} population conservation failed: expected {expected}, actual {actual}")]
     PopulationConservation {
-        year: u16,
+        year: u64,
         expected: i128,
         actual: usize,
     },
     #[error("the simulation year cannot exceed {0}")]
-    YearOverflow(u16),
+    YearOverflow(u64),
 }
 
 /// CLIとテストから扱うシミュレーション実行器。
@@ -80,7 +80,7 @@ impl Simulation {
         })
     }
 
-    pub fn run(&mut self, years: u16) -> Result<(), SimulationError> {
+    pub fn run(&mut self, years: u64) -> Result<(), SimulationError> {
         for _ in 0..years {
             self.run_year()?;
         }
@@ -89,12 +89,13 @@ impl Simulation {
 
     /// 1年を進め、確定した年次統計を返す。
     pub fn run_year(&mut self) -> Result<&YearStatistics, SimulationError> {
+        self.world.year_events.clear();
         let previous_population = self.world.active_population();
         self.world.year = self
             .world
             .year
             .checked_add(1)
-            .ok_or(SimulationError::YearOverflow(u16::MAX))?;
+            .ok_or(SimulationError::YearOverflow(u64::MAX))?;
         self.world.month = 0;
         let year = self.world.year;
         let mut statistics = YearStatistics::new(year, 0, Vec::new());
@@ -1557,6 +1558,40 @@ impl Simulation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn simulation_can_advance_beyond_the_previous_u16_year_limit() {
+        let mut simulation = Simulation::new(1, 20, 7, SimulationConfig::normal()).unwrap();
+        simulation.world.year = u64::from(u16::MAX);
+
+        simulation.run_year().unwrap();
+
+        assert_eq!(simulation.world.year, u64::from(u16::MAX) + 1);
+    }
+
+    #[test]
+    fn run_year_replaces_the_year_event_buffer() {
+        let mut simulation = Simulation::new(1, 20, 7, SimulationConfig::normal()).unwrap();
+        simulation.world.capture_year_events = true;
+        simulation.world.push_event(WorldEvent::DiseaseOutbreak);
+        assert_eq!(simulation.world.year_events[0].year, 0);
+
+        simulation.run_year().unwrap();
+
+        assert!(
+            simulation
+                .world
+                .year_events
+                .iter()
+                .all(|timed| timed.year == 1)
+        );
+        assert!(
+            simulation
+                .world
+                .important_events
+                .contains(&WorldEvent::DiseaseOutbreak)
+        );
+    }
 
     #[test]
     fn utility_snapshot_contains_real_social_and_partner_intents() {

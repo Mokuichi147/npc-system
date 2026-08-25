@@ -50,11 +50,11 @@ pub struct Goal {
     pub kind: GoalKind,
     #[serde(deserialize_with = "deserialize_progress")]
     pub progress: f32,
-    pub since_year: u16,
+    pub since_year: u64,
 }
 
 impl Goal {
-    pub const fn new(kind: GoalKind, since_year: u16) -> Self {
+    pub const fn new(kind: GoalKind, since_year: u64) -> Self {
         Self {
             kind,
             progress: MIN_GOAL_PROGRESS,
@@ -62,7 +62,7 @@ impl Goal {
         }
     }
 
-    pub fn with_progress(kind: GoalKind, progress: f32, since_year: u16) -> Self {
+    pub fn with_progress(kind: GoalKind, progress: f32, since_year: u64) -> Self {
         Self {
             kind,
             progress: clamp_progress(progress),
@@ -93,25 +93,25 @@ impl Goal {
         self.progress >= MAX_GOAL_PROGRESS
     }
 
-    pub const fn years_held(&self, current_year: u16) -> u16 {
+    pub const fn years_held(&self, current_year: u64) -> u64 {
         current_year.saturating_sub(self.since_year)
     }
 
     /// 通常変更ならクールダウンを確認し、重大イベントなら即時変更を許す。
     pub const fn can_change(
         &self,
-        current_year: u16,
+        current_year: u64,
         cooldown_years: u16,
         major_event: bool,
     ) -> bool {
-        major_event || self.years_held(current_year) >= cooldown_years
+        major_event || self.years_held(current_year) >= cooldown_years as u64
     }
 
     /// 変更できた場合だけ種類・開始年・進捗をまとめて更新する。
     pub fn change_to(
         &mut self,
         new_kind: GoalKind,
-        current_year: u16,
+        current_year: u64,
         cooldown_years: u16,
         major_event: bool,
     ) -> bool {
