@@ -99,7 +99,7 @@ impl RelationshipDecayConfig {
     pub fn should_forget(
         &self,
         relation: u8,
-        years_since_interaction: u16,
+        years_since_interaction: u64,
         protected: bool,
     ) -> bool {
         if protected || relation >= self.permanent_relation_min.min(10) {
@@ -107,9 +107,9 @@ impl RelationshipDecayConfig {
         }
 
         if relation <= self.weak_relation_max.min(10) {
-            years_since_interaction >= self.weak_forget_years
+            years_since_interaction >= u64::from(self.weak_forget_years)
         } else if relation == self.friendly_relation.min(10) {
-            years_since_interaction >= self.friendly_forget_years
+            years_since_interaction >= u64::from(self.friendly_forget_years)
         } else {
             false
         }
@@ -266,8 +266,8 @@ impl SimulationConfig {
     pub fn should_forget_relationship(
         &self,
         relation: u8,
-        last_interaction_year: u16,
-        current_year: u16,
+        last_interaction_year: u64,
+        current_year: u64,
         protected: bool,
     ) -> bool {
         self.relationship_decay.should_forget(

@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use crate::disaster::FamineEvent;
 use crate::disease::DiseaseEvent;
-use crate::event::WorldEvent;
+use crate::event::{TimedWorldEvent, WorldEvent};
 use crate::id::{NpcId, TownId};
 use crate::npc::{Npc, NpcInvariantError};
 use crate::statistics::Statistics;
@@ -15,7 +15,7 @@ use crate::war::WarEvent;
 ///
 /// NPCはIDとVec indexを一致させ、死亡・転出後もremoveしない。
 pub struct World {
-    pub year: u16,
+    pub year: u64,
     pub month: u8,
     pub npcs: Vec<Npc>,
     pub towns: Vec<Town>,
@@ -25,6 +25,10 @@ pub struct World {
     pub active_famines: Vec<FamineEvent>,
     pub statistics: Statistics,
     pub important_events: Vec<WorldEvent>,
+    /// 現在年に発生した全イベント。年次処理の開始時にclearする。
+    pub year_events: Vec<TimedWorldEvent>,
+    /// タイムライン用途で年次イベントを収集するか。
+    pub capture_year_events: bool,
     pub rng: ChaCha8Rng,
 }
 
@@ -43,6 +47,8 @@ impl World {
             active_famines: Vec::new(),
             statistics: Statistics::default(),
             important_events: Vec::new(),
+            year_events: Vec::new(),
+            capture_year_events: false,
             rng: ChaCha8Rng::seed_from_u64(seed),
         }
     }
@@ -130,6 +136,10 @@ impl World {
     }
 
     pub fn push_event(&mut self, event: WorldEvent) {
+        if self.capture_year_events {
+            self.year_events
+                .push(TimedWorldEvent::new(self.year, self.month, event.clone()));
+        }
         if self.important_events.len() == Self::MAX_RETAINED_EVENTS {
             let remove = Self::MAX_RETAINED_EVENTS / 4;
             self.important_events.drain(..remove);
@@ -276,4 +286,24 @@ pub enum InvariantError {
     RelatedPartners(NpcId, NpcId),
     #[error("親子関係が非対称: parent={0:?}, child={1:?}")]
     BrokenParentChild(NpcId, NpcId),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pushed_events_keep_the_current_year_and_month() {
+        let mut world = World::empty(1);
+        world.capture_year_events = true;
+        world.year = 12;
+        world.month = 7;
+        world.push_event(WorldEvent::DiseaseOutbreak);
+
+        assert_eq!(world.important_events, vec![WorldEvent::DiseaseOutbreak]);
+        assert_eq!(world.year_events.len(), 1);
+        assert_eq!(world.year_events[0].year, 12);
+        assert_eq!(world.year_events[0].month, 7);
+        assert_eq!(world.year_events[0].event, WorldEvent::DiseaseOutbreak);
+    }
 }

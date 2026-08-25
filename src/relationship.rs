@@ -4,8 +4,8 @@ pub const MIN_RELATIONSHIP_VALUE: u8 = 0;
 pub const MAX_RELATIONSHIP_VALUE: u8 = 10;
 pub const NEUTRAL_RELATION: u8 = 5;
 pub const MAX_SINGLE_RELATION_CHANGE: i8 = 3;
-pub const WEAK_RELATION_FORGET_YEARS: u16 = 4;
-pub const FRIENDLY_RELATION_FORGET_YEARS: u16 = 8;
+pub const WEAK_RELATION_FORGET_YEARS: u64 = 4;
+pub const FRIENDLY_RELATION_FORGET_YEARS: u64 = 8;
 
 #[derive(
     Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash,
@@ -38,14 +38,14 @@ pub struct Relationship {
     #[serde(deserialize_with = "deserialize_relationship_value")]
     pub relation: u8,
     pub kind: RelationshipKind,
-    pub last_interaction_year: u16,
+    pub last_interaction_year: u64,
     #[serde(deserialize_with = "deserialize_month")]
     pub last_interaction_month: u8,
 }
 
 impl Relationship {
     /// 新規交流を中立の関係値5で作る。
-    pub const fn new(affinity: u8, kind: RelationshipKind, year: u16, month: u8) -> Self {
+    pub const fn new(affinity: u8, kind: RelationshipKind, year: u64, month: u8) -> Self {
         Self {
             affinity: clamp_relationship_value(affinity),
             relation: NEUTRAL_RELATION,
@@ -60,7 +60,7 @@ impl Relationship {
         affinity: u8,
         relation: u8,
         kind: RelationshipKind,
-        year: u16,
+        year: u64,
         month: u8,
     ) -> Self {
         Self {
@@ -106,7 +106,7 @@ impl Relationship {
         self.relation as i8 - previous as i8
     }
 
-    pub fn record_interaction(&mut self, year: u16, month: u8) {
+    pub fn record_interaction(&mut self, year: u64, month: u8) {
         self.last_interaction_year = year;
         self.last_interaction_month = clamp_month(month);
     }
@@ -120,7 +120,7 @@ impl Relationship {
     }
 
     /// 年次tick向けの忘却判定。
-    pub const fn should_forget(&self, current_year: u16) -> bool {
+    pub const fn should_forget(&self, current_year: u64) -> bool {
         if self.is_permanent() || self.relation >= 7 {
             return false;
         }
@@ -135,7 +135,7 @@ impl Relationship {
     }
 
     /// 月まで考慮する、より厳密な忘却判定。月は`1..=12`として扱う。
-    pub const fn should_forget_at(&self, current_year: u16, current_month: u8) -> bool {
+    pub const fn should_forget_at(&self, current_year: u64, current_month: u8) -> bool {
         if self.is_permanent() || self.relation >= 7 {
             return false;
         }
@@ -148,7 +148,7 @@ impl Relationship {
         } else {
             FRIENDLY_RELATION_FORGET_YEARS
         };
-        inactive_months >= required_years as u32 * 12
+        inactive_months >= required_years as u128 * 12
     }
 }
 
@@ -176,8 +176,8 @@ pub const fn clamp_month(month: u8) -> u8 {
     }
 }
 
-const fn absolute_month(year: u16, month: u8) -> u32 {
-    year as u32 * 12 + (clamp_month(month) - 1) as u32
+const fn absolute_month(year: u64, month: u8) -> u128 {
+    year as u128 * 12 + (clamp_month(month) - 1) as u128
 }
 
 fn deserialize_relationship_value<'de, D>(deserializer: D) -> Result<u8, D::Error>
@@ -246,8 +246,8 @@ mod tests {
             Relationship::with_relation(2, 0, RelationshipKind::Family, 0, 1),
             Relationship::with_relation(2, 0, RelationshipKind::Partner, 0, 1),
         ] {
-            assert!(!relationship.should_forget(u16::MAX));
-            assert!(!relationship.should_forget_at(u16::MAX, 12));
+            assert!(!relationship.should_forget(u64::MAX));
+            assert!(!relationship.should_forget_at(u64::MAX, 12));
         }
     }
 

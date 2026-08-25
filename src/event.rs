@@ -88,6 +88,22 @@ pub enum WorldEvent {
     },
 }
 
+/// 1年分のタイムライン表示に使う、発生時刻付きイベント。
+///
+/// `month=0` は年初の年次処理、`1..=12` は月次処理を表す。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimedWorldEvent {
+    pub year: u64,
+    pub month: u8,
+    pub event: WorldEvent,
+}
+
+impl TimedWorldEvent {
+    pub const fn new(year: u64, month: u8, event: WorldEvent) -> Self {
+        Self { year, month, event }
+    }
+}
+
 impl WorldEvent {
     pub const fn kind(&self) -> WorldEventKind {
         match self {
@@ -162,5 +178,23 @@ mod tests {
         };
         let json = serde_json::to_string(&event).unwrap();
         assert_eq!(serde_json::from_str::<WorldEvent>(&json).unwrap(), event);
+    }
+
+    #[test]
+    fn timed_event_json_round_trip_preserves_timestamp() {
+        let timed = TimedWorldEvent::new(
+            42,
+            7,
+            WorldEvent::Migration {
+                npc: NpcId(3),
+                from: TownId(1),
+                to: TownId(2),
+            },
+        );
+        let json = serde_json::to_string(&timed).unwrap();
+        assert_eq!(
+            serde_json::from_str::<TimedWorldEvent>(&json).unwrap(),
+            timed
+        );
     }
 }
