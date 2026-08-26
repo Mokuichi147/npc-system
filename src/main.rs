@@ -1,5 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 use npc_system::belief::BeliefKind;
+use npc_system::economy::{Good, TownEconomicStatistics};
+use npc_system::extensions::enabled_extension_ids;
 use npc_system::goal::GoalKind;
 use npc_system::id::NpcId;
 use npc_system::npc::{Npc, NpcState, Sex};
@@ -65,6 +67,14 @@ struct SimulateArgs {
     /// 10年ごとの進捗を省略し、最終結果だけを表示する。
     #[arg(long)]
     summary_only: bool,
+
+    /// 都市経済力と商品単価の年次推移を表示する。
+    #[arg(long)]
+    economy_history: bool,
+
+    /// 経済推移を表示する都市ID。複数回指定でき、未指定時は全都市。
+    #[arg(long = "economy-town", value_name = "ID")]
+    economy_town_ids: Vec<u16>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -98,6 +108,7 @@ enum AppError {
 #[derive(Debug, Serialize)]
 struct SimulationReport<'a> {
     format_version: u8,
+    enabled_extensions: &'static [&'static str],
     seed: u64,
     requested_years: u16,
     config: &'a SimulationConfig,
@@ -115,6 +126,7 @@ struct StateMetadata {
     total_population: usize,
     total_unique_npcs: usize,
     town_populations: Vec<TownPopulation>,
+    town_economies: Vec<TownEconomicStatistics>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -208,11 +220,23 @@ fn simulate(args: SimulateArgs) -> Result<(), AppError> {
     let final_state = capture_state(&simulation.world);
 
     print_final_summary(&initial_state, &final_state, &cumulative, health, &warnings);
+    if args.economy_history {
+        if cfg!(feature = "economy-extension") {
+            print_economy_history(
+                &simulation.world,
+                &simulation.world.statistics.years,
+                &args.economy_town_ids,
+            );
+        } else {
+            println!("\n経済履歴: economy-extensionが無効なため表示できません");
+        }
+    }
     print_requested_npcs(&simulation.world, &args.npc_ids);
 
     if let Some(path) = args.output.as_deref() {
         let report = SimulationReport {
-            format_version: 1,
+            format_version: 5,
+            enabled_extensions: enabled_extension_ids(),
             seed: args.seed,
             requested_years,
             config: &config,
@@ -251,6 +275,11 @@ fn capture_state(world: &World) -> StateMetadata {
         total_population: world.active_population(),
         total_unique_npcs: world.total_unique_npcs(),
         town_populations,
+        town_economies: if cfg!(feature = "economy-extension") {
+            world.town_economic_statistics()
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -314,6 +343,14 @@ fn print_final_summary(
         "登場した固有NPC   : {}",
         format_number(final_state.total_unique_npcs)
     );
+    println!(
+        "有効な拡張機能    : {}",
+        if enabled_extension_ids().is_empty() {
+            "なし".to_owned()
+        } else {
+            enabled_extension_ids().join(", ")
+        }
+    );
 
     println!("\nイベント累計");
     println!("  出生            : {}", format_number(cumulative.births));
@@ -358,6 +395,20 @@ fn print_final_summary(
         format_number(cumulative.goal_changes)
     );
 
+    if cfg!(feature = "economy-extension") {
+        println!("\n経済累計");
+        println!(
+            "  総生産 / 取引総額     : {} / {}",
+            format_money(cumulative.gross_product_cents),
+            format_money(cumulative.trade_volume_cents)
+        );
+        println!(
+            "  購入 / 譲渡件数       : {} / {}",
+            format_u64(cumulative.economic_transactions),
+            format_u64(cumulative.money_transfers)
+        );
+    }
+
     println!("\n都市人口");
     println!(
         "  {:<4} {:<12} {:>10} {:>10} {:>9}",
@@ -375,6 +426,10 @@ fn print_final_summary(
         );
     }
 
+    if cfg!(feature = "economy-extension") {
+        print_final_economy(final_state);
+    }
+
     if warnings.is_empty() {
         println!("\n警告: なし");
     } else {
@@ -382,6 +437,136 @@ fn print_final_summary(
         for warning in warnings {
             println!("  - {}", warning_label(warning));
         }
+    }
+}
+
+fn print_final_economy(final_state: &StateMetadata) {
+    println!("\n都市経済（最終年）");
+    println!(
+        "  {:<4} {:<12} {:>13} {:>13} {:>8} {:>9} {:>9} {:>8}",
+        "ID", "都市", "経済力", "域内総生産", "物価", "物価変動", "失業率", "Gini"
+    );
+    for economy in &final_state.town_economies {
+        let name = final_state
+            .town_populations
+            .iter()
+            .find(|town| town.id == economy.town.0)
+            .map_or("不明", |town| town.name.as_str());
+        println!(
+            "  {:<4} {:<12} {:>13} {:>13} {:>8.2} {:>+8.2}% {:>8.2}% {:>8.3}",
+            economy.town.0,
+            name,
+            format_money(economy.economic_power_cents),
+            format_money(economy.gross_product_cents),
+            economy.price_index as f64 / 10_000.0,
+            economy.inflation_basis_points as f64 / 100.0,
+            economy.unemployment_basis_points as f64 / 100.0,
+            economy.gini_basis_points as f64 / 10_000.0,
+        );
+    }
+
+    println!("\n商品単価（最終年）");
+    println!(
+        "  {:<4} {:<12} {:>18} {:>18} {:>18} {:>18} {:>18}",
+        "ID", "都市", "食料", "衣料", "医薬品", "工具", "嗜好品"
+    );
+    for economy in &final_state.town_economies {
+        let name = final_state
+            .town_populations
+            .iter()
+            .find(|town| town.id == economy.town.0)
+            .map_or("不明", |town| town.name.as_str());
+        println!(
+            "  {:<4} {:<12} {:>18} {:>18} {:>18} {:>18} {:>18}",
+            economy.town.0,
+            name,
+            format_good_price(economy, Good::Food),
+            format_good_price(economy, Good::Clothing),
+            format_good_price(economy, Good::Medicine),
+            format_good_price(economy, Good::Tools),
+            format_good_price(economy, Good::Luxury),
+        );
+    }
+}
+
+fn print_economy_history(world: &World, years: &[YearStatistics], town_ids: &[u16]) {
+    let selected = |town: u16| town_ids.is_empty() || town_ids.contains(&town);
+    println!("\n=== 都市経済力の推移 ===");
+    println!(
+        "  {:>6} {:<4} {:<12} {:>14} {:>14} {:>8} {:>9}",
+        "年", "ID", "都市", "経済力", "域内総生産", "物価", "物価変動"
+    );
+    for year in years {
+        for economy in year
+            .town_economies
+            .iter()
+            .filter(|economy| selected(economy.town.0))
+        {
+            println!(
+                "  {:>6} {:<4} {:<12} {:>14} {:>14} {:>8.2} {:>+8.2}%",
+                year.year,
+                economy.town.0,
+                town_name(world, economy.town),
+                format_money(economy.economic_power_cents),
+                format_money(economy.gross_product_cents),
+                economy.price_index as f64 / 10_000.0,
+                economy.inflation_basis_points as f64 / 100.0,
+            );
+        }
+    }
+
+    println!("\n=== 商品単価の推移 ===");
+    println!(
+        "  {:>6} {:<4} {:<8} {:>12} {:>9} {:>10} {:>12} {:>14}",
+        "年", "ID", "商品", "単価", "騰落率", "供給変動", "取引数量", "取引総額"
+    );
+    for year in years {
+        for economy in year
+            .town_economies
+            .iter()
+            .filter(|economy| selected(economy.town.0))
+        {
+            for good in &economy.goods {
+                println!(
+                    "  {:>6} {:<4} {:<8} {:>12} {:>+8.2}% {:>+9.2}% {:>12} {:>14}",
+                    year.year,
+                    economy.town.0,
+                    good_label(good.good),
+                    format_money(good.unit_price_cents),
+                    good.inflation_basis_points as f64 / 100.0,
+                    good.supply_shock_basis_points as f64 / 100.0,
+                    format_u64(good.annual_quantity),
+                    format_money(good.annual_trade_volume_cents),
+                );
+            }
+        }
+    }
+}
+
+fn format_good_price(economy: &TownEconomicStatistics, good: Good) -> String {
+    economy
+        .goods
+        .iter()
+        .find(|item| item.good == good)
+        .map_or_else(
+            || "-".to_owned(),
+            |item| {
+                format!(
+                    "{} ({:+.1}%)",
+                    format_money(item.unit_price_cents),
+                    item.inflation_basis_points as f64 / 100.0
+                )
+            },
+        )
+}
+
+fn good_label(good: Good) -> &'static str {
+    match good {
+        Good::Food => "食料",
+        Good::Clothing => "衣料",
+        Good::Medicine => "医薬品",
+        Good::Tools => "工具",
+        Good::Luxury => "嗜好品",
     }
 }
 
@@ -417,6 +602,29 @@ fn warning_label(warning: &SimulationWarning) -> String {
         SimulationWarning::PopulationCollapse { decline } => {
             format!("人口が初期値から{:.0}%減少しています", decline * 100.0)
         }
+        SimulationWarning::HighInflation { town, basis_points } => format!(
+            "都市{}のインフレ率が{:.2}%です",
+            town.0,
+            *basis_points as f64 / 100.0
+        ),
+        SimulationWarning::SevereDeflation { town, basis_points } => format!(
+            "都市{}のデフレ率が{:.2}%です",
+            town.0,
+            -*basis_points as f64 / 100.0
+        ),
+        SimulationWarning::HighUnemployment { town, basis_points } => format!(
+            "都市{}の失業率が{:.2}%です",
+            town.0,
+            *basis_points as f64 / 100.0
+        ),
+        SimulationWarning::WealthInequality {
+            town,
+            gini_basis_points,
+        } => format!(
+            "都市{}の資産Gini係数が{:.3}です",
+            town.0,
+            *gini_basis_points as f64 / 10_000.0
+        ),
     }
 }
 
@@ -450,6 +658,22 @@ fn print_npc_details(world: &World, npc: &Npc) {
     println!("出生地     : {}", town_name(world, npc.hometown));
     println!("最終居住地 : {}", town_name(world, npc.town));
     println!("現在状態   : {}", state_label(npc.state));
+    if cfg!(feature = "economy-extension") {
+        println!("所持金     : {}", format_money(npc.money_cents));
+        let inventory = npc
+            .inventory
+            .iter()
+            .map(|(good, quantity)| format!("{good:?}×{quantity}"))
+            .collect::<Vec<_>>();
+        println!(
+            "所有商品   : {}",
+            if inventory.is_empty() {
+                "なし".to_owned()
+            } else {
+                inventory.join(", ")
+            }
+        );
+    }
     println!(
         "能力       : 身体 {}/10 | 器用 {}/10 | 知性 {}/10 | 魅力 {}/10 | 意志 {}/10",
         npc.attributes.physical,
@@ -609,6 +833,10 @@ fn belief_label(belief: BeliefKind) -> &'static str {
 }
 
 fn format_number(value: usize) -> String {
+    format_u64(value as u64)
+}
+
+fn format_u64(value: u64) -> String {
     let digits = value.to_string();
     let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, character) in digits.chars().enumerate() {
@@ -618,6 +846,10 @@ fn format_number(value: usize) -> String {
         formatted.push(character);
     }
     formatted
+}
+
+fn format_money(cents: u64) -> String {
+    format!("{}.{:02}", format_u64(cents / 100), cents % 100)
 }
 
 fn write_report(path: &Path, report: &SimulationReport<'_>) -> Result<(), AppError> {
@@ -668,6 +900,9 @@ mod tests {
             "--npc",
             "11023",
             "--summary-only",
+            "--economy-history",
+            "--economy-town",
+            "3",
         ])
         .unwrap();
 
@@ -680,6 +915,8 @@ mod tests {
         assert_eq!(args.output, Some(PathBuf::from("result.json")));
         assert_eq!(args.npc_ids, vec![3_185, 11_023]);
         assert!(args.summary_only);
+        assert!(args.economy_history);
+        assert_eq!(args.economy_town_ids, vec![3]);
     }
 
     #[test]

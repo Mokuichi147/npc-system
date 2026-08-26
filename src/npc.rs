@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet, hash_map::Entry};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::belief::{Belief, BeliefKind, MAX_BELIEFS};
+use crate::economy::{Inventory, Money};
 use crate::goal::{Goal, GoalKind};
 use crate::id::{NpcId, TownId};
 use crate::relationship::{Relationship, RelationshipKind};
@@ -146,6 +147,11 @@ pub struct Npc {
     pub in_world: bool,
     #[serde(default)]
     pub state: NpcState,
+    /// 最小通貨単位（1/100通貨）で保持する現金残高。
+    #[serde(default)]
+    pub money_cents: Money,
+    #[serde(default)]
+    pub inventory: Inventory,
 }
 
 impl Npc {
@@ -178,6 +184,8 @@ impl Npc {
             alive: true,
             in_world: true,
             state: NpcState::Normal,
+            money_cents: initial_money_for_age(age, attributes),
+            inventory: Inventory::default(),
         };
         npc.normalize();
         npc
@@ -540,6 +548,18 @@ impl Npc {
             self.validate().err()
         );
     }
+}
+
+fn initial_money_for_age(age: u8, attributes: Attributes) -> Money {
+    if age < ADULT_AGE {
+        return Money::from(age) * 250;
+    }
+    let skill = Money::from(attributes.intelligence)
+        .saturating_add(Money::from(attributes.dexterity))
+        .saturating_add(Money::from(attributes.charisma));
+    30_000_u64
+        .saturating_add(Money::from(age.saturating_sub(ADULT_AGE)) * 1_200)
+        .saturating_add(skill * 1_000)
 }
 
 pub const fn clamp_attribute(value: u8) -> u8 {

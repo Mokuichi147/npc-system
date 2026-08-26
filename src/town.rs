@@ -1,4 +1,5 @@
 use crate::belief::Belief;
+use crate::economy::TownEconomy;
 use crate::id::TownId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -60,6 +61,8 @@ pub struct Town {
     pub neighbors: Vec<TownConnection>,
     #[serde(default)]
     pub temporary_damage: TownDamage,
+    #[serde(default)]
+    pub economy: TownEconomy,
 }
 
 impl Town {
@@ -74,18 +77,21 @@ impl Town {
         freedom: u8,
         wealth: u8,
     ) -> Self {
+        let population_capacity = population_capacity.max(1);
+        let wealth = wealth.min(10);
         Self {
             id,
             name: name.into(),
-            population_capacity: population_capacity.max(1),
+            population_capacity,
             jobs: jobs.min(10),
             safety: safety.min(10),
             education: education.min(10),
             freedom: freedom.min(10),
-            wealth: wealth.min(10),
+            wealth,
             culture: Vec::new(),
             neighbors: Vec::new(),
             temporary_damage: TownDamage::default(),
+            economy: TownEconomy::new(wealth, population_capacity),
         }
     }
 
@@ -178,7 +184,19 @@ impl Town {
             (5.0 + (occupancy - 1.20) * 5.0).min(9.0)
         };
 
-        (quality - occupancy_penalty).clamp(0.0, 10.0)
+        #[cfg(feature = "economy-extension")]
+        let (purchasing_power_adjustment, unemployment_penalty) = {
+            let price_ratio = f64::from(self.economy.price_index) / 10_000.0;
+            (
+                ((1.0 - price_ratio) * 0.8).clamp(-1.5, 0.5),
+                f64::from(self.economy.unemployment_basis_points()) / 10_000.0 * 1.5,
+            )
+        };
+        #[cfg(not(feature = "economy-extension"))]
+        let (purchasing_power_adjustment, unemployment_penalty) = (0.0, 0.0);
+
+        (quality + purchasing_power_adjustment - unemployment_penalty - occupancy_penalty)
+            .clamp(0.0, 10.0)
     }
 
     /// 同じ接続先がある場合は短い距離を採用する。
