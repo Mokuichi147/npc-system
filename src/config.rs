@@ -155,6 +155,14 @@ pub struct SimulationConfig {
     pub disease_max_mortality: f64,
     pub war_max_mortality: f64,
     pub famine_max_mortality: f64,
+
+    /// 経済tickの基準月給・最低生活費（最小通貨単位）。
+    pub base_monthly_wage_cents: u64,
+    pub base_monthly_living_cost_cents: u64,
+    /// 10000bp = 100%。
+    pub income_tax_basis_points: u16,
+    /// 需給差に対する月次物価調整の強さ（bp）。
+    pub price_adjustment_basis_points: u16,
 }
 
 impl Default for SimulationConfig {
@@ -216,6 +224,10 @@ impl SimulationConfig {
             disease_max_mortality: 0.06,
             war_max_mortality: 0.045,
             famine_max_mortality: 0.08,
+            base_monthly_wage_cents: 24_000,
+            base_monthly_living_cost_cents: 9_000,
+            income_tax_basis_points: 1_000,
+            price_adjustment_basis_points: 240,
         }
     }
 

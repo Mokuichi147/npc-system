@@ -4,6 +4,10 @@ use thiserror::Error;
 
 use crate::disaster::FamineEvent;
 use crate::disease::DiseaseEvent;
+use crate::economy::{
+    EconomyError, Good, GoodPriceStatistics, Money, TownEconomicStatistics, TransactionReceipt,
+    TransferReceipt, gini_basis_points,
+};
 use crate::event::{TimedWorldEvent, WorldEvent};
 use crate::id::{NpcId, TownId};
 use crate::npc::{Npc, NpcInvariantError};
@@ -123,6 +127,200 @@ impl World {
             }
         }
         residents
+    }
+
+    /// NPC間で通貨を譲渡する。失敗時は双方の残高を変更しない。
+    pub fn transfer_money(
+        &mut self,
+        from: NpcId,
+        to: NpcId,
+        amount_cents: Money,
+    ) -> Result<TransferReceipt, EconomyError> {
+        if from == to {
+            return Err(EconomyError::SameNpc(from));
+        }
+        if amount_cents == 0 {
+            return Err(EconomyError::ZeroAmount);
+        }
+        let source = self.npc(from).ok_or(EconomyError::InvalidNpc(from))?;
+        let destination = self.npc(to).ok_or(EconomyError::InvalidNpc(to))?;
+        if !source.is_active() {
+            return Err(EconomyError::InactiveNpc(from));
+        }
+        if !destination.is_active() {
+            return Err(EconomyError::InactiveNpc(to));
+        }
+        if source.money_cents < amount_cents {
+            return Err(EconomyError::InsufficientFunds {
+                npc: from,
+                required: amount_cents,
+                available: source.money_cents,
+            });
+        }
+        if destination.money_cents.checked_add(amount_cents).is_none() {
+            return Err(EconomyError::AmountOverflow);
+        }
+        let town = source.town;
+        let (source, destination) = self
+            .two_npcs_mut(from, to)
+            .expect("IDs and active state were validated");
+        source.money_cents -= amount_cents;
+        destination.money_cents += amount_cents;
+        if let Some(economy) = self.town_mut(town).map(|town| &mut town.economy) {
+            economy.annual_transfers = economy.annual_transfers.saturating_add(1);
+        }
+        Ok(TransferReceipt {
+            from,
+            to,
+            amount_cents,
+        })
+    }
+
+    /// NPC間で商品を購入する。通貨と在庫を原子的に移動する。
+    pub fn purchase(
+        &mut self,
+        buyer: NpcId,
+        seller: NpcId,
+        good: Good,
+        quantity: u32,
+        unit_price_cents: Money,
+    ) -> Result<TransactionReceipt, EconomyError> {
+        if buyer == seller {
+            return Err(EconomyError::SameNpc(buyer));
+        }
+        if quantity == 0 || unit_price_cents == 0 {
+            return Err(EconomyError::ZeroAmount);
+        }
+        let total_cents = unit_price_cents
+            .checked_mul(Money::from(quantity))
+            .ok_or(EconomyError::AmountOverflow)?;
+        let buyer_snapshot = self.npc(buyer).ok_or(EconomyError::InvalidNpc(buyer))?;
+        let seller_snapshot = self.npc(seller).ok_or(EconomyError::InvalidNpc(seller))?;
+        if !buyer_snapshot.is_active() {
+            return Err(EconomyError::InactiveNpc(buyer));
+        }
+        if !seller_snapshot.is_active() {
+            return Err(EconomyError::InactiveNpc(seller));
+        }
+        if buyer_snapshot.money_cents < total_cents {
+            return Err(EconomyError::InsufficientFunds {
+                npc: buyer,
+                required: total_cents,
+                available: buyer_snapshot.money_cents,
+            });
+        }
+        if seller_snapshot
+            .money_cents
+            .checked_add(total_cents)
+            .is_none()
+            || buyer_snapshot
+                .inventory
+                .quantity(good)
+                .checked_add(quantity)
+                .is_none()
+        {
+            return Err(EconomyError::AmountOverflow);
+        }
+        let available = seller_snapshot.inventory.quantity(good);
+        if available < quantity {
+            return Err(EconomyError::InsufficientInventory {
+                npc: seller,
+                good,
+                required: quantity,
+                available,
+            });
+        }
+        let market_town = seller_snapshot.town;
+        let (buyer_npc, seller_npc) = self
+            .two_npcs_mut(buyer, seller)
+            .expect("IDs and active state were validated");
+        buyer_npc.money_cents -= total_cents;
+        seller_npc.money_cents += total_cents;
+        let removed = seller_npc.inventory.remove(good, quantity);
+        debug_assert!(removed);
+        buyer_npc.inventory.add(good, quantity);
+        if let Some(town) = self.town_mut(market_town) {
+            town.economy
+                .record_good_trade(good, u64::from(quantity), total_cents);
+        }
+        Ok(TransactionReceipt {
+            buyer,
+            seller,
+            good,
+            quantity,
+            total_cents,
+        })
+    }
+
+    /// 売り手が住む都市の現在の市場単価で購入する。
+    pub fn purchase_at_market_price(
+        &mut self,
+        buyer: NpcId,
+        seller: NpcId,
+        good: Good,
+        quantity: u32,
+    ) -> Result<TransactionReceipt, EconomyError> {
+        let seller_npc = self.npc(seller).ok_or(EconomyError::InvalidNpc(seller))?;
+        let unit_price = self
+            .town(seller_npc.town)
+            .map_or(good.base_price_cents(), |town| {
+                town.economy.good_price(good)
+            });
+        self.purchase(buyer, seller, good, quantity, unit_price)
+    }
+
+    pub fn town_economic_statistics(&self) -> Vec<TownEconomicStatistics> {
+        let residents = self.residents_by_town();
+        self.towns
+            .iter()
+            .enumerate()
+            .map(|(index, town)| {
+                let wealth = residents
+                    .get(index)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|&id| self.npc(id).map(|npc| npc.money_cents))
+                    .collect::<Vec<_>>();
+                let resident_wealth_cents = wealth.iter().copied().fold(0, Money::saturating_add);
+                let economic_power_cents = resident_wealth_cents
+                    .saturating_add(town.economy.treasury_cents)
+                    .saturating_add(town.economy.annual_output_cents);
+                TownEconomicStatistics {
+                    town: town.id,
+                    gross_product_cents: town.economy.annual_output_cents,
+                    trade_volume_cents: town.economy.annual_trade_volume_cents,
+                    transactions: town.economy.annual_transactions,
+                    transfers: town.economy.annual_transfers,
+                    resident_wealth_cents,
+                    treasury_cents: town.economy.treasury_cents,
+                    economic_power_cents,
+                    price_index: town.economy.price_index,
+                    inflation_basis_points: town.economy.inflation_basis_points(),
+                    labor_force: town.economy.labor_force,
+                    employed: town.economy.employed,
+                    unemployment_basis_points: town.economy.unemployment_basis_points(),
+                    gini_basis_points: gini_basis_points(&wealth),
+                    goods: Good::ALL
+                        .into_iter()
+                        .map(|good| {
+                            let market = town.economy.markets.get(&good);
+                            GoodPriceStatistics {
+                                good,
+                                unit_price_cents: town.economy.good_price(good),
+                                price_index: town.economy.good_price_index(good),
+                                inflation_basis_points: market
+                                    .map_or(0, |market| market.inflation_basis_points()),
+                                annual_quantity: market.map_or(0, |market| market.annual_quantity),
+                                annual_trade_volume_cents: market
+                                    .map_or(0, |market| market.annual_trade_volume_cents),
+                                supply_shock_basis_points: market
+                                    .map_or(0, |market| market.annual_supply_shock_basis_points),
+                            }
+                        })
+                        .collect(),
+                }
+            })
+            .collect()
     }
 
     pub fn rebuild_active_npcs(&mut self) {

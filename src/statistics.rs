@@ -1,4 +1,6 @@
+use crate::economy::{Money, TownEconomicStatistics};
 use crate::event::{DeathCause, WorldEvent};
+use crate::id::TownId;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -21,6 +23,16 @@ pub struct YearStatistics {
     pub famine_deaths: usize,
     /// World.towns と同じ安定順で格納する。
     pub town_populations: Vec<usize>,
+    #[serde(default)]
+    pub gross_product_cents: Money,
+    #[serde(default)]
+    pub trade_volume_cents: Money,
+    #[serde(default)]
+    pub economic_transactions: u64,
+    #[serde(default)]
+    pub money_transfers: u64,
+    #[serde(default)]
+    pub town_economies: Vec<TownEconomicStatistics>,
 }
 
 impl YearStatistics {
@@ -103,6 +115,11 @@ pub struct CumulativeStatistics {
     pub war_deaths: usize,
     pub famine_deaths: usize,
     pub town_populations: Vec<usize>,
+    pub gross_product_cents: Money,
+    pub trade_volume_cents: Money,
+    pub economic_transactions: u64,
+    pub money_transfers: u64,
+    pub town_economies: Vec<TownEconomicStatistics>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -213,6 +230,9 @@ impl Statistics {
         result.town_populations = self
             .latest()
             .map_or_else(Vec::new, |year| year.town_populations.clone());
+        result.town_economies = self
+            .latest()
+            .map_or_else(Vec::new, |year| year.town_economies.clone());
         for year in &self.years {
             add_to_cumulative(&mut result, year);
         }
@@ -292,6 +312,32 @@ impl Statistics {
             }
         }
 
+        for economy in &cumulative.town_economies {
+            if economy.inflation_basis_points >= 1_000 {
+                warnings.push(SimulationWarning::HighInflation {
+                    town: economy.town,
+                    basis_points: economy.inflation_basis_points,
+                });
+            } else if economy.inflation_basis_points <= -500 {
+                warnings.push(SimulationWarning::SevereDeflation {
+                    town: economy.town,
+                    basis_points: economy.inflation_basis_points,
+                });
+            }
+            if economy.unemployment_basis_points >= 2_500 {
+                warnings.push(SimulationWarning::HighUnemployment {
+                    town: economy.town,
+                    basis_points: economy.unemployment_basis_points,
+                });
+            }
+            if economy.gini_basis_points >= 6_000 {
+                warnings.push(SimulationWarning::WealthInequality {
+                    town: economy.town,
+                    gini_basis_points: economy.gini_basis_points,
+                });
+            }
+        }
+
         warnings
     }
 }
@@ -315,6 +361,16 @@ fn add_to_cumulative(result: &mut CumulativeStatistics, year: &YearStatistics) {
     result.disease_deaths = result.disease_deaths.saturating_add(year.disease_deaths);
     result.war_deaths = result.war_deaths.saturating_add(year.war_deaths);
     result.famine_deaths = result.famine_deaths.saturating_add(year.famine_deaths);
+    result.gross_product_cents = result
+        .gross_product_cents
+        .saturating_add(year.gross_product_cents);
+    result.trade_volume_cents = result
+        .trade_volume_cents
+        .saturating_add(year.trade_volume_cents);
+    result.economic_transactions = result
+        .economic_transactions
+        .saturating_add(year.economic_transactions);
+    result.money_transfers = result.money_transfers.saturating_add(year.money_transfers);
 }
 
 /// 年次統計からは導けない関係グラフの健全性指標。
@@ -329,14 +385,42 @@ pub struct SimulationHealthMetrics {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SimulationWarning {
-    RelationshipPolarization { fraction: f64 },
-    DenseRelationshipGraph { average: f64 },
-    TownConcentration { share: f64 },
+    RelationshipPolarization {
+        fraction: f64,
+    },
+    DenseRelationshipGraph {
+        average: f64,
+    },
+    TownConcentration {
+        share: f64,
+    },
     NoMigration,
     NoGoalChanges,
-    FrequentGoalChanges { average_per_npc_year: f64 },
-    PopulationExplosion { factor: f64 },
-    PopulationCollapse { decline: f64 },
+    FrequentGoalChanges {
+        average_per_npc_year: f64,
+    },
+    PopulationExplosion {
+        factor: f64,
+    },
+    PopulationCollapse {
+        decline: f64,
+    },
+    HighInflation {
+        town: TownId,
+        basis_points: i32,
+    },
+    SevereDeflation {
+        town: TownId,
+        basis_points: i32,
+    },
+    HighUnemployment {
+        town: TownId,
+        basis_points: u32,
+    },
+    WealthInequality {
+        town: TownId,
+        gini_basis_points: u32,
+    },
 }
 
 impl fmt::Display for SimulationWarning {
@@ -373,6 +457,33 @@ impl fmt::Display for SimulationWarning {
                 f,
                 "WARN: population decreased {:.0}% (> 90%)",
                 decline * 100.0
+            ),
+            Self::HighInflation { town, basis_points } => write!(
+                f,
+                "WARN: town {} inflation is {:.2}%",
+                town.0,
+                *basis_points as f64 / 100.0
+            ),
+            Self::SevereDeflation { town, basis_points } => write!(
+                f,
+                "WARN: town {} deflation is {:.2}%",
+                town.0,
+                *basis_points as f64 / 100.0
+            ),
+            Self::HighUnemployment { town, basis_points } => write!(
+                f,
+                "WARN: town {} unemployment is {:.2}%",
+                town.0,
+                *basis_points as f64 / 100.0
+            ),
+            Self::WealthInequality {
+                town,
+                gini_basis_points,
+            } => write!(
+                f,
+                "WARN: town {} wealth Gini is {:.3}",
+                town.0,
+                *gini_basis_points as f64 / 10_000.0
             ),
         }
     }
@@ -438,13 +549,22 @@ mod tests {
         for year_number in 1..=3 {
             let mut year = YearStatistics::new(year_number, 100 + year_number as usize, vec![]);
             year.births = year_number as usize;
+            year.gross_product_cents = year_number * 1_000;
+            year.trade_volume_cents = year_number * 100;
+            year.economic_transactions = year_number * 10;
+            year.money_transfers = year_number;
             statistics.push(year);
         }
 
         assert_eq!(statistics.years.len(), 1);
         assert_eq!(statistics.latest().map(|year| year.year), Some(3));
         assert_eq!(statistics.total_years(), 3);
-        assert_eq!(statistics.cumulative().births, 6);
+        let cumulative = statistics.cumulative();
+        assert_eq!(cumulative.births, 6);
+        assert_eq!(cumulative.gross_product_cents, 6_000);
+        assert_eq!(cumulative.trade_volume_cents, 600);
+        assert_eq!(cumulative.economic_transactions, 60);
+        assert_eq!(cumulative.money_transfers, 6);
     }
 
     #[test]

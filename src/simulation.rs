@@ -8,6 +8,10 @@ use crate::belief::{Belief, BeliefKind};
 use crate::config::SimulationConfig;
 use crate::disaster::{FamineConditions, FamineEvent, NaturalDisaster, NaturalDisasterEvent};
 use crate::event::{DeathCause, WorldEvent};
+#[cfg(feature = "economy-extension")]
+use crate::extensions::SimulationExtension;
+#[cfg(feature = "economy-extension")]
+use crate::extensions::economy::EconomyExtension;
 use crate::goal::GoalKind;
 use crate::id::{NpcId, TownId};
 use crate::migration::{candidate_towns, household_members, move_household};
@@ -99,6 +103,8 @@ impl Simulation {
         self.world.month = 0;
         let year = self.world.year;
         let mut statistics = YearStatistics::new(year, 0, Vec::new());
+        #[cfg(feature = "economy-extension")]
+        EconomyExtension::begin_year(&mut self.world);
 
         self.age_active_npcs();
 
@@ -121,6 +127,8 @@ impl Simulation {
             self.world.month = month;
             self.progress_diseases_and_famines(&mut statistics);
             let actions = self.choose_utility_actions();
+            #[cfg(feature = "economy-extension")]
+            EconomyExtension::run_month(&mut self.world, &self.config, &actions);
             self.process_social_events(&actions, &mut statistics);
             self.process_partnerships(&actions, &mut statistics);
             self.process_internal_migration(&actions, &mut statistics);
@@ -139,6 +147,8 @@ impl Simulation {
 
         statistics.total_population = self.world.active_population();
         statistics.town_populations = self.world.town_populations();
+        #[cfg(feature = "economy-extension")]
+        EconomyExtension::finish_year(&self.world, &mut statistics);
         let expected = previous_population as i128
             + statistics.births as i128
             + statistics.external_immigration as i128
@@ -455,6 +465,9 @@ impl Simulation {
             affected_family.sort_unstable();
             affected_family.dedup();
 
+            #[cfg(feature = "economy-extension")]
+            EconomyExtension::before_npc_death(&mut self.world, id, &affected_family);
+
             if let Some(npc) = self.world.npc_mut(id) {
                 npc.mark_dead();
             }
@@ -478,6 +491,7 @@ impl Simulation {
         self.world.rebuild_active_npcs();
     }
 
+    /// 現金と商品を近親者へ均等相続させる。相続人がいなければ都市財政へ戻す。
     fn process_births(&mut self, statistics: &mut YearStatistics) -> Result<(), PopulationError> {
         let mut populations = self.world.town_populations();
         let candidates = self.world.active_npcs.clone();
@@ -1274,7 +1288,7 @@ impl Simulation {
                 at_war,
                 natural_disaster: town.temporary_damage.safety_loss >= 3,
                 disease_outbreak,
-                has_work: town.effective_jobs() >= 3,
+                has_work: town.effective_jobs() > 0,
                 socializing_allowed: !disease_outbreak,
                 family_needs_care,
                 can_move: self.world.towns.len() > 1,
@@ -1379,6 +1393,16 @@ impl Simulation {
             .world
             .town(npc.town)
             .map_or(0, |town| 10u8.saturating_sub(town.effective_safety()));
+        #[cfg(feature = "economy-extension")]
+        let economic_hardship = self.world.town(npc.town).is_some_and(|town| {
+            npc.money_cents
+                < town
+                    .economy
+                    .indexed_price(self.config.base_monthly_living_cost_cents)
+                    .saturating_mul(2)
+        });
+        #[cfg(not(feature = "economy-extension"))]
+        let economic_hardship = false;
         if danger >= 6 {
             GoalKind::Survive
         } else if npc.age < 18 {
@@ -1393,6 +1417,8 @@ impl Simulation {
             })
         {
             GoalKind::RaiseChildren
+        } else if economic_hardship {
+            GoalKind::GainWealth
         } else if npc.belief_strength(BeliefKind::ValueKnowledge) >= 7 {
             GoalKind::SeekKnowledge
         } else if npc.belief_strength(BeliefKind::ValueWealth) >= 7 {
