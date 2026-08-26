@@ -307,7 +307,7 @@ impl Npc {
     pub fn change_goal(
         &mut self,
         new_kind: GoalKind,
-        current_year: u16,
+        current_year: u64,
         cooldown_years: u16,
         major_event: bool,
     ) -> bool {
@@ -330,7 +330,7 @@ impl Npc {
         &mut self,
         other: NpcId,
         affinity: u8,
-        year: u16,
+        year: u64,
         month: u8,
     ) -> Option<&mut Relationship> {
         if other == self.id {
@@ -375,7 +375,7 @@ impl Npc {
     }
 
     /// 年次tickで忘却候補を削除する。戻り値は常にID昇順で再現可能。
-    pub fn forget_stale_relationships(&mut self, current_year: u16) -> Vec<NpcId> {
+    pub fn forget_stale_relationships(&mut self, current_year: u64) -> Vec<NpcId> {
         let mut forgotten = self
             .relationships
             .iter()
@@ -393,7 +393,7 @@ impl Npc {
     /// 月単位の厳密な忘却版。戻り値は常にID昇順。
     pub fn forget_stale_relationships_at(
         &mut self,
-        current_year: u16,
+        current_year: u64,
         current_month: u8,
     ) -> Vec<NpcId> {
         let mut forgotten = self

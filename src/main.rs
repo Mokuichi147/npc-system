@@ -1,4 +1,7 @@
+mod cli_timeline;
+
 use clap::{Args, Parser, Subcommand};
+use cli_timeline::TimelineCollector;
 use npc_system::belief::BeliefKind;
 use npc_system::economy::{Good, TownEconomicStatistics};
 use npc_system::extensions::enabled_extension_ids;
@@ -9,13 +12,15 @@ use npc_system::statistics::{
     CumulativeStatistics, SimulationHealthMetrics, SimulationWarning, YearStatistics,
 };
 use npc_system::{Simulation, SimulationConfig, SimulationError, World, WorldDanger};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
-use std::num::{NonZeroU16, NonZeroU32};
+use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -32,6 +37,8 @@ struct Cli {
 enum Command {
     /// NPC・都市・世代交代シミュレーションを実行する。
     Simulate(SimulateArgs),
+    /// status JSONを読み、シミュレーションの稼働状態を表示する。
+    Status(StatusArgs),
 }
 
 #[derive(Debug, Args)]
@@ -44,9 +51,9 @@ struct SimulateArgs {
     #[arg(long)]
     population: NonZeroU32,
 
-    /// シミュレーションする年数（1以上）。
+    /// シミュレーションする年数（1以上）。省略すると無期限に実行する。
     #[arg(long)]
-    years: NonZeroU16,
+    years: Option<NonZeroU64>,
 
     /// 再現可能な乱数seed。
     #[arg(long)]
@@ -75,6 +82,45 @@ struct SimulateArgs {
     /// 経済推移を表示する都市ID。複数回指定でき、未指定時は全都市。
     #[arg(long = "economy-town", value_name = "ID")]
     economy_town_ids: Vec<u16>,
+
+    /// 世界全体の年次統計と重大イベントをタイムライン表示する。
+    #[arg(long)]
+    timeline_world: bool,
+
+    /// 指定都市IDの人口・出生死亡・転入出をタイムライン表示する。複数回指定できる。
+    #[arg(long = "timeline-town", value_name = "ID")]
+    timeline_town_ids: Vec<u16>,
+
+    /// 指定NPC IDの人生イベントをタイムライン表示する。複数回指定できる。
+    #[arg(long = "timeline-npc", value_name = "ID")]
+    timeline_npc_ids: Vec<u32>,
+
+    /// 稼働状態を原子的に更新するJSONファイル。無期限実行時の既定値は npc-system-status.json。
+    #[arg(long, value_name = "FILE")]
+    status_file: Option<PathBuf>,
+
+    /// status JSONを更新する間隔（シミュレーション年）。
+    #[arg(long, default_value_t = NonZeroU64::new(1).expect("non-zero"))]
+    status_interval_years: NonZeroU64,
+}
+
+#[derive(Debug, Args)]
+struct StatusArgs {
+    /// 読み込むstatus JSONファイル。
+    #[arg(long, value_name = "FILE", default_value = "npc-system-status.json")]
+    file: PathBuf,
+
+    /// 指定秒ごとに状態を再読込して監視し続ける。
+    #[arg(long)]
+    watch: bool,
+
+    /// --watch の更新間隔（秒）。
+    #[arg(long, default_value_t = NonZeroU64::new(2).expect("non-zero"))]
+    interval_seconds: NonZeroU64,
+
+    /// 最終更新からこの秒数を超えたらstaleと表示する。
+    #[arg(long, default_value_t = 30)]
+    stale_after_seconds: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -102,6 +148,23 @@ enum AppError {
         #[source]
         source: io::Error,
     },
+
+    #[error("無期限実行では {0} を使用できません（履歴が増え続けるため）")]
+    UnsupportedContinuousOption(&'static str),
+
+    #[error("statusファイル '{path}' の処理に失敗しました: {source}")]
+    StatusIo {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("statusファイル '{path}' のJSON処理に失敗しました: {source}")]
+    StatusJson {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
 }
 
 /// JSONのフィールド順も出力仕様の一部とするため、mapではなくstructで保持する。
@@ -110,7 +173,7 @@ struct SimulationReport<'a> {
     format_version: u8,
     enabled_extensions: &'static [&'static str],
     seed: u64,
-    requested_years: u16,
+    requested_years: u64,
     config: &'a SimulationConfig,
     initial_state: StateMetadata,
     final_state: StateMetadata,
@@ -122,7 +185,7 @@ struct SimulationReport<'a> {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct StateMetadata {
-    year: u16,
+    year: u64,
     total_population: usize,
     total_unique_npcs: usize,
     town_populations: Vec<TownPopulation>,
@@ -135,6 +198,96 @@ struct TownPopulation {
     name: String,
     population: usize,
     capacity: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RunState {
+    Running,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StatusReport {
+    format_version: u8,
+    state: RunState,
+    pid: u32,
+    continuous: bool,
+    seed: u64,
+    started_at_unix_seconds: u64,
+    updated_at_unix_seconds: u64,
+    uptime_seconds: u64,
+    year: u64,
+    years_completed: u64,
+    target_years: Option<u64>,
+    population: usize,
+    total_unique_npcs: usize,
+    town_populations: Vec<usize>,
+    last_year_statistics: Option<YearStatistics>,
+    relationship_health: SimulationHealthMetrics,
+    warnings: Vec<SimulationWarning>,
+    error: Option<String>,
+}
+
+struct StatusContext {
+    path: PathBuf,
+    started_at_unix_seconds: u64,
+    started_at: Instant,
+    initial_year: u64,
+    target_years: Option<u64>,
+    seed: u64,
+}
+
+impl StatusContext {
+    fn new(path: PathBuf, initial_year: u64, target_years: Option<u64>, seed: u64) -> Self {
+        Self {
+            path,
+            started_at_unix_seconds: unix_seconds(),
+            started_at: Instant::now(),
+            initial_year,
+            target_years,
+            seed,
+        }
+    }
+
+    fn report(
+        &self,
+        simulation: &Simulation,
+        state: RunState,
+        error: Option<String>,
+    ) -> StatusReport {
+        let health = simulation.health_metrics();
+        StatusReport {
+            format_version: 1,
+            state,
+            pid: std::process::id(),
+            continuous: self.target_years.is_none(),
+            seed: self.seed,
+            started_at_unix_seconds: self.started_at_unix_seconds,
+            updated_at_unix_seconds: unix_seconds(),
+            uptime_seconds: self.started_at.elapsed().as_secs(),
+            year: simulation.world.year,
+            years_completed: simulation.world.year.saturating_sub(self.initial_year),
+            target_years: self.target_years,
+            population: simulation.world.active_population(),
+            total_unique_npcs: simulation.world.total_unique_npcs(),
+            town_populations: simulation.world.town_populations(),
+            last_year_statistics: simulation.world.statistics.latest().cloned(),
+            relationship_health: health,
+            warnings: simulation.world.statistics.detect_warnings(health),
+            error,
+        }
+    }
+
+    fn write(
+        &self,
+        simulation: &Simulation,
+        state: RunState,
+        error: Option<String>,
+    ) -> Result<(), AppError> {
+        write_status(&self.path, &self.report(simulation, state, error))
+    }
 }
 
 /// 前回表示したcheckpointから今回までの値を保持する。
@@ -182,17 +335,67 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<(), AppError> {
     match cli.command {
         Command::Simulate(args) => simulate(args),
+        Command::Status(args) => show_status(args),
     }
 }
 
 fn simulate(args: SimulateArgs) -> Result<(), AppError> {
+    let target_years = args.years.map(NonZeroU64::get);
+    let continuous = target_years.is_none();
+    if continuous && args.output.is_some() {
+        return Err(AppError::UnsupportedContinuousOption("--output"));
+    }
+    if continuous && !args.npc_ids.is_empty() {
+        return Err(AppError::UnsupportedContinuousOption("--npc"));
+    }
+    if continuous && args.economy_history {
+        return Err(AppError::UnsupportedContinuousOption("--economy-history"));
+    }
+    if continuous && !args.economy_town_ids.is_empty() {
+        return Err(AppError::UnsupportedContinuousOption("--economy-town"));
+    }
+    if continuous && args.timeline_world {
+        return Err(AppError::UnsupportedContinuousOption("--timeline-world"));
+    }
+    if continuous && !args.timeline_town_ids.is_empty() {
+        return Err(AppError::UnsupportedContinuousOption("--timeline-town"));
+    }
+    if continuous && !args.timeline_npc_ids.is_empty() {
+        return Err(AppError::UnsupportedContinuousOption("--timeline-npc"));
+    }
+
     let town_count = usize::from(args.towns.get());
     let initial_population = args.population.get() as usize;
-    let requested_years = args.years.get();
     let config = SimulationConfig::for_danger(args.world_danger);
     let mut simulation =
         Simulation::new(town_count, initial_population, args.seed, config.clone())?;
+    if continuous {
+        simulation.world.statistics.retain_only_latest_year();
+    }
+    simulation.world.capture_year_events = args.timeline_world
+        || !args.timeline_town_ids.is_empty()
+        || !args.timeline_npc_ids.is_empty();
     let initial_state = capture_state(&simulation.world);
+    let mut timelines = TimelineCollector::new(
+        &simulation.world,
+        args.timeline_world,
+        &args.timeline_town_ids,
+        &args.timeline_npc_ids,
+    );
+    let status_path = args
+        .status_file
+        .clone()
+        .or_else(|| continuous.then(|| PathBuf::from("npc-system-status.json")));
+    let status = status_path
+        .map(|path| StatusContext::new(path, simulation.world.year, target_years, args.seed));
+
+    if let Some(status) = &status {
+        status.write(&simulation, RunState::Running, None)?;
+        println!("status file: {}", status.path.display());
+    }
+    if continuous {
+        println!("無期限モードで実行します（停止するまで年次処理を継続します）");
+    }
 
     if !args.summary_only {
         print_progress_header(&initial_state);
@@ -200,17 +403,37 @@ fn simulate(args: SimulateArgs) -> Result<(), AppError> {
 
     let mut period = PeriodSummary::default();
     let mut period_start_year = 1;
-    for elapsed_years in 1..=requested_years {
+    let mut elapsed_years = 0u64;
+    loop {
+        if target_years.is_some_and(|target| elapsed_years >= target) {
+            break;
+        }
+        elapsed_years = elapsed_years.saturating_add(1);
         // 参照を保持したまま次の年へ進めないよう、直後にcloneする。
-        let year = simulation.run_year()?.clone();
+        let year = match simulation.run_year() {
+            Ok(year) => year.clone(),
+            Err(error) => {
+                if let Some(status) = &status {
+                    let _ = status.write(&simulation, RunState::Failed, Some(error.to_string()));
+                }
+                return Err(error.into());
+            }
+        };
+        timelines.record_year(&simulation.world, &year);
         period.add_year(&year);
 
-        if elapsed_years % 10 == 0 || elapsed_years == requested_years {
+        let reached_target = target_years.is_some_and(|target| elapsed_years == target);
+        if elapsed_years % 10 == 0 || reached_target {
             if !args.summary_only {
                 print_period_summary(period_start_year, &year, &period);
             }
             period_start_year = year.year.saturating_add(1);
             period = PeriodSummary::default();
+        }
+        if let Some(status) = &status {
+            if elapsed_years % args.status_interval_years.get() == 0 || reached_target {
+                status.write(&simulation, RunState::Running, None)?;
+            }
         }
     }
 
@@ -232,13 +455,18 @@ fn simulate(args: SimulateArgs) -> Result<(), AppError> {
         }
     }
     print_requested_npcs(&simulation.world, &args.npc_ids);
+    timelines.print(&simulation.world);
+
+    if let Some(status) = &status {
+        status.write(&simulation, RunState::Completed, None)?;
+    }
 
     if let Some(path) = args.output.as_deref() {
         let report = SimulationReport {
             format_version: 5,
             enabled_extensions: enabled_extension_ids(),
             seed: args.seed,
-            requested_years,
+            requested_years: target_years.expect("output is unavailable in continuous mode"),
             config: &config,
             initial_state,
             final_state,
@@ -302,7 +530,7 @@ fn print_progress_header(initial: &StateMetadata) {
     );
 }
 
-fn print_period_summary(start_year: u16, year: &YearStatistics, period: &PeriodSummary) {
+fn print_period_summary(start_year: u64, year: &YearStatistics, period: &PeriodSummary) {
     println!(
         "{:<13} {:>10} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
         format!("{}-{}年", start_year, year.year),
@@ -852,6 +1080,112 @@ fn format_money(cents: u64) -> String {
     format!("{}.{:02}", format_u64(cents / 100), cents % 100)
 }
 
+fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn write_status(path: &Path, report: &StatusReport) -> Result<(), AppError> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("npc-system-status.json");
+    let temporary = path.with_file_name(format!(".{file_name}.tmp.{}", std::process::id()));
+    let file = File::create(&temporary).map_err(|source| AppError::StatusIo {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut writer, report).map_err(|source| AppError::StatusJson {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    writer
+        .write_all(b"\n")
+        .and_then(|()| writer.flush())
+        .map_err(|source| AppError::StatusIo {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    fs::rename(&temporary, path).map_err(|source| AppError::StatusIo {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn read_status(path: &Path) -> Result<StatusReport, AppError> {
+    let file = File::open(path).map_err(|source| AppError::StatusIo {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    serde_json::from_reader(file).map_err(|source| AppError::StatusJson {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn show_status(args: StatusArgs) -> Result<(), AppError> {
+    loop {
+        let report = read_status(&args.file)?;
+        if args.watch {
+            print!("\x1b[2J\x1b[H");
+        }
+        print_status(&args.file, &report, args.stale_after_seconds);
+        io::stdout().flush().map_err(|source| AppError::StatusIo {
+            path: args.file.clone(),
+            source,
+        })?;
+        if !args.watch {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_secs(args.interval_seconds.get()));
+    }
+}
+
+fn print_status(path: &Path, report: &StatusReport, stale_after_seconds: u64) {
+    let age = unix_seconds().saturating_sub(report.updated_at_unix_seconds);
+    let stale = report.state == RunState::Running && age > stale_after_seconds;
+    let state = if stale {
+        "stale（更新停止）"
+    } else {
+        match report.state {
+            RunState::Running => "running（実行中）",
+            RunState::Completed => "completed（完了）",
+            RunState::Failed => "failed（失敗）",
+        }
+    };
+    println!("=== npc-system status ===");
+    println!("ファイル       : {}", path.display());
+    println!("状態           : {state}");
+    println!("PID            : {}", report.pid);
+    println!(
+        "モード         : {}",
+        if report.continuous {
+            "無期限"
+        } else {
+            "期間指定"
+        }
+    );
+    println!("現在年         : {}", report.year);
+    match report.target_years {
+        Some(target) => println!("進捗           : {} / {}年", report.years_completed, target),
+        None => println!("経過           : {}年", report.years_completed),
+    }
+    println!("人口           : {}", format_number(report.population));
+    println!(
+        "登場した固有NPC: {}",
+        format_number(report.total_unique_npcs)
+    );
+    println!("稼働時間       : {}秒", report.uptime_seconds);
+    println!("最終更新       : {age}秒前");
+    println!("警告数         : {}", report.warnings.len());
+    if let Some(error) = &report.error {
+        println!("エラー         : {error}");
+    }
+}
+
 fn write_report(path: &Path, report: &SimulationReport<'_>) -> Result<(), AppError> {
     let file = File::create(path).map_err(|source| AppError::CreateOutput {
         path: path.to_path_buf(),
@@ -903,13 +1237,24 @@ mod tests {
             "--economy-history",
             "--economy-town",
             "3",
+            "--timeline-world",
+            "--timeline-town",
+            "5",
+            "--timeline-town",
+            "12",
+            "--timeline-npc",
+            "3185",
+            "--timeline-npc",
+            "11023",
         ])
         .unwrap();
 
-        let Command::Simulate(args) = cli.command;
+        let Command::Simulate(args) = cli.command else {
+            panic!("simulate subcommand was expected");
+        };
         assert_eq!(args.towns.get(), 20);
         assert_eq!(args.population.get(), 5_000);
-        assert_eq!(args.years.get(), 100);
+        assert_eq!(args.years.map(NonZeroU64::get), Some(100));
         assert_eq!(args.seed, 12_345);
         assert_eq!(args.world_danger, WorldDanger::Harsh);
         assert_eq!(args.output, Some(PathBuf::from("result.json")));
@@ -917,6 +1262,9 @@ mod tests {
         assert!(args.summary_only);
         assert!(args.economy_history);
         assert_eq!(args.economy_town_ids, vec![3]);
+        assert!(args.timeline_world);
+        assert_eq!(args.timeline_town_ids, vec![5, 12]);
+        assert_eq!(args.timeline_npc_ids, vec![3_185, 11_023]);
     }
 
     #[test]
@@ -935,6 +1283,49 @@ mod tests {
         ])
         .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn omitting_years_selects_continuous_mode() {
+        let cli = Cli::try_parse_from([
+            "npc-system",
+            "simulate",
+            "--towns",
+            "2",
+            "--population",
+            "20",
+            "--seed",
+            "7",
+        ])
+        .unwrap();
+        let Command::Simulate(args) = cli.command else {
+            panic!("simulate subcommand was expected");
+        };
+
+        assert!(args.years.is_none());
+        assert!(args.status_file.is_none());
+        assert_eq!(args.status_interval_years.get(), 1);
+    }
+
+    #[test]
+    fn status_file_round_trip_is_atomic_and_readable() {
+        let path = std::env::temp_dir().join(format!(
+            "npc-system-status-test-{}-{}.json",
+            std::process::id(),
+            unix_seconds()
+        ));
+        let simulation =
+            Simulation::new(1, 10, 7, SimulationConfig::normal()).expect("valid simulation");
+        let context = StatusContext::new(path.clone(), 0, None, 7);
+        context
+            .write(&simulation, RunState::Running, None)
+            .expect("status is writable");
+
+        let status = read_status(&path).expect("status is readable");
+        assert_eq!(status.state, RunState::Running);
+        assert!(status.continuous);
+        assert_eq!(status.population, 10);
+        fs::remove_file(path).expect("test status can be removed");
     }
 
     #[test]

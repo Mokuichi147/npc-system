@@ -4,7 +4,7 @@ use npc_system::npc::MAX_ATTRIBUTE;
 use npc_system::{Simulation, SimulationConfig};
 
 const INITIAL_POPULATION: usize = 100;
-const YEARS: u16 = 100;
+const YEARS: u64 = 100;
 const SEED: u64 = 123;
 
 #[test]
@@ -15,7 +15,10 @@ fn test_d_one_town_hundred_npcs_run_for_hundred_years_reproducibly() {
     simulation.run(YEARS).expect("100年間を完走できる");
 
     assert_eq!(simulation.world.year, YEARS);
-    assert_eq!(simulation.world.statistics.years.len(), usize::from(YEARS));
+    assert_eq!(
+        simulation.world.statistics.years.len(),
+        usize::try_from(YEARS).unwrap()
+    );
     simulation
         .world
         .validate()

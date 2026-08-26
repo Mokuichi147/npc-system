@@ -370,7 +370,7 @@ impl SimulationExtension for EconomyExtension {
 }
 
 /// 年単位で持続する商品別供給ショック。Worldの乱数列を消費せず再現可能にする。
-fn annual_supply_shock_basis_points(year: u16, town: u16, good: Good, town_signature: u64) -> i32 {
+fn annual_supply_shock_basis_points(year: u64, town: u16, good: Good, town_signature: u64) -> i32 {
     let amplitude = match good {
         Good::Food => 2_000_u64,
         Good::Clothing => 1_200,
@@ -379,7 +379,7 @@ fn annual_supply_shock_basis_points(year: u16, town: u16, good: Good, town_signa
         Good::Luxury => 2_200,
     };
     let key = town_signature
-        ^ u64::from(year).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ year.wrapping_mul(0x9E37_79B9_7F4A_7C15)
         ^ u64::from(town).wrapping_mul(0xBF58_476D_1CE4_E5B9)
         ^ good.ordinal().wrapping_mul(0x94D0_49BB_1331_11EB);
     let mixed = mix_u64(key);

@@ -87,7 +87,7 @@ fn run(args: Args) -> Result<(), String> {
     )
     .map_err(|error| error.to_string())?;
     simulation
-        .run(args.warmup_years)
+        .run(u64::from(args.warmup_years))
         .map_err(|error| error.to_string())?;
     let mut app = App::new(
         simulation,
@@ -786,7 +786,7 @@ fn history_points(app: &App, value: impl Fn(&TownEconomicStatistics) -> Money) -
             year.town_economies
                 .iter()
                 .find(|economy| economy.town == app.town_id)
-                .map(|economy| (f64::from(year.year), value(economy) as f64 / 100.0))
+                .map(|economy| (year.year as f64, value(economy) as f64 / 100.0))
         })
         .collect()
 }
